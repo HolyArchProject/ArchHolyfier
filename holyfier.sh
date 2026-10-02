@@ -122,12 +122,8 @@ ln -sf "$LORDHELP_BIN" /usr/local/bin/pacman
 PROFILE_SCRIPT="/etc/profile.d/lordhelop.sh"
 cat << 'EOF' > "$PROFILE_SCRIPT"
 #!/bin/bash
-# Strict verification for interactive console environments to prevent fastfetch loop at boot sequence
-if [ -t 1 ] && [[ $- == *i* ]]; then
-    if [ -x /usr/local/bin/fastfetch ]; then
-        /usr/local/bin/fastfetch
-    fi
-fi
+# Fixed: Auto-run command removed completely to ensure clean system shell boots
+:
 EOF
 chmod +x "$PROFILE_SCRIPT"
 
