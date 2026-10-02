@@ -7,7 +7,7 @@ LOGO_PATH="/etc/lordhelop-logo.txt"
 cat << 'EOF' > "$LOGO_PATH"
                  ...
                  :&;.
-                .$$&&$.
+               .$$&&$.
                  :&;.
            .&&&&&&&&&&&&&:
                  :&;.
@@ -122,7 +122,8 @@ ln -sf "$LORDHELP_BIN" /usr/local/bin/pacman
 PROFILE_SCRIPT="/etc/profile.d/lordhelop.sh"
 cat << 'EOF' > "$PROFILE_SCRIPT"
 #!/bin/bash
-if [[ $- == *i* ]]; then
+# Strict verification for interactive console environments to prevent fastfetch loop at boot sequence
+if [ -t 1 ] && [[ $- == *i* ]]; then
     if [ -x /usr/local/bin/fastfetch ]; then
         /usr/local/bin/fastfetch
     fi
@@ -144,4 +145,3 @@ done
 
 echo ""
 echo "please reboot for changes to come in act"
-
