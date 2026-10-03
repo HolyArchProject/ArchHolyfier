@@ -5,3 +5,4 @@ What is this?
 It's a simple shell script that puts a skin over pacman and its syntaxises (for now only basics like install and delete)
 pacman becomes lordhelp
 -S becomes install and the list goes on.
+It also hijacks all your fetches with its own logo since HolyArch is still in development as a distro.
