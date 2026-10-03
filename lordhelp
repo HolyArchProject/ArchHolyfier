@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""lordhelp: keeps a HolyArch system in sync with holyconfig.arch."""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import namedtuple
+
+CONFIG = os.environ.get("HOLY_CONFIG", "/etc/holyarch/holyconfig.arch")
+STATE_DIR = os.environ.get("HOLY_STATE", "/var/lib/holyarch")
+GEN_DIR = os.path.join(STATE_DIR, "generations")
+MANAGED = os.path.join(STATE_DIR, "managed.json")
+
+SOURCES = ("repo", "aur", "flatpak", "snap")
+DEFAULT_ORDER = "repo aur flatpak snap"
+AUR_HELPERS = ("paru", "yay")
+FLATHUB = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+
+# never removed by rebuildconfig
+PROTECTED = {"base", "pacman", "linux", "linux-firmware", "python", "holyarch",
+             "paru", "paru-bin", "paru-git", "yay", "yay-bin", "yay-git",
+             "flatpak", "snapd"}
+SNAP_SYSTEM = re.compile(r"^(core\d*|bare|snapd|gtk-common-themes|gnome-.*|kde-.*|mesa-.*)$")
+
+BLOCKS = {"settings", "packages", "services"}
+SETTINGS = {"hostname": str, "timezone": str, "remove_unlisted": bool,
+            "sources": str, "aur_helper": str, "aur_user": str}
+
+
+class HolySyntaxError(Exception):
+    pass
+
+
+TOKEN_RE = re.compile(r"""
+    (?P<ws>[ \t\r]+)
+  | (?P<nl>\n)
+  | (?P<comment>\#[^\n]*)
+  | (?P<string>"(?:[^"\\\n]|\\.)*")
+  | (?P<lbrace>\{)
+  | (?P<rbrace>\})
+  | (?P<eq>=)
+  | (?P<word>!?[A-Za-z0-9@._+\-/:]+)
+""", re.X)
+
+
+def tokenize(text):
+    pos, line = 0, 1
+    while pos < len(text):
+        m = TOKEN_RE.match(text, pos)
+        if not m:
+            raise HolySyntaxError(f"line {line}: unexpected character {text[pos]!r}")
+        kind, val = m.lastgroup, m.group()
+        if kind == "nl":
+            line += 1
+        elif kind == "string":
+            yield ("string", bytes(val[1:-1], "utf-8").decode("unicode_escape"), line)
+        elif kind not in ("ws", "comment"):
+            yield (kind, val, line)
+        pos = m.end()
+
+
+def split_entry(entry):
+    src, sep, name = entry.partition(":")
+    return (src, name) if sep else (None, entry)
+
+
+def parse(text):
+    toks = list(tokenize(text))
+    cfg = {"settings": {}, "packages": [], "services": []}
+    i = 0
+
+    def peek():
+        return toks[i] if i < len(toks) else ("eof", "", toks[-1][2] if toks else 1)
+
+    def expect(kind):
+        nonlocal i
+        tok = peek()
+        if tok[0] != kind:
+            raise HolySyntaxError(f"line {tok[2]}: expected {kind}, got {tok[1] or tok[0]!r}")
+        i += 1
+        return tok
+
+    while i < len(toks):
+        _, block, line = expect("word")
+        if block not in BLOCKS:
+            raise HolySyntaxError(f"line {line}: unknown block '{block}' "
+                                  f"(valid: {', '.join(sorted(BLOCKS))})")
+        expect("lbrace")
+        while peek()[0] != "rbrace":
+            kind, name, line = peek()
+            if kind == "eof":
+                raise HolySyntaxError(f"line {line}: missing '}}' for block '{block}'")
+            expect("word")
+            if peek()[0] == "eq":
+                i += 1
+                if block != "settings":
+                    raise HolySyntaxError(f"line {line}: assignments only allowed in 'settings'")
+                vkind, value, _ = peek()
+                if vkind not in ("string", "word"):
+                    raise HolySyntaxError(f"line {line}: expected a value after '='")
+                i += 1
+                if name not in SETTINGS:
+                    raise HolySyntaxError(f"line {line}: unknown setting '{name}'")
+                if SETTINGS[name] is bool:
+                    if value not in ("true", "false"):
+                        raise HolySyntaxError(f"line {line}: '{name}' must be true or false")
+                    value = value == "true"
+                if name == "sources":
+                    bad = [s for s in value.split() if s not in SOURCES]
+                    if bad:
+                        raise HolySyntaxError(f"line {line}: unknown source '{bad[0]}' "
+                                              f"(valid: {' '.join(SOURCES)})")
+                if name == "aur_helper" and value not in ("auto",) + AUR_HELPERS:
+                    raise HolySyntaxError(f"line {line}: aur_helper must be auto, paru or yay")
+                cfg["settings"][name] = value
+            else:
+                if block == "settings":
+                    raise HolySyntaxError(f"line {line}: expected '{name} = value'")
+                if name.startswith("!") and block == "packages":
+                    raise HolySyntaxError(f"line {line}: '!' is only valid in 'services'")
+                src, pkg = split_entry(name)
+                if block == "packages" and src is not None and (src not in SOURCES or not pkg):
+                    raise HolySyntaxError(f"line {line}: unknown source '{src}:' "
+                                          f"(valid: {', '.join(s + ':' for s in SOURCES)})")
+                if name in cfg[block]:
+                    warn(f"line {line}: duplicate '{name}'")
+                else:
+                    cfg[block].append(name)
+        expect("rbrace")
+    return cfg
+
+
+def load_config(path=CONFIG):
+    try:
+        with open(path) as f:
+            return parse(f.read())
+    except FileNotFoundError:
+        die(f"{path} not found - run 'lordhelp init' first")
+    except HolySyntaxError as e:
+        die(f"{path}: {e}")
+
+
+def source_order(cfg):
+    return cfg["settings"].get("sources", DEFAULT_ORDER).split()
+
+
+def edit_packages(add=(), remove=()):
+    with open(CONFIG) as f:
+        lines = f.read().splitlines()
+    current = parse("\n".join(lines))["packages"]
+    listed = set(current) | {split_entry(e)[1] for e in current}
+    add = [p for p in dict.fromkeys(add) if p not in listed and split_entry(p)[1] not in listed]
+    remove = set(remove)
+
+    start = next((n for n, l in enumerate(lines) if re.match(r"\s*packages\s*\{\s*(#.*)?$", l)), None)
+    if start is None:
+        lines += ["", "packages {", "}"]
+        start = len(lines) - 2
+    end = next((n for n in range(start + 1, len(lines)) if lines[n].strip().startswith("}")), None)
+    if end is None:
+        die("cannot edit config: 'packages {' and its closing '}' must be on separate lines")
+
+    out = lines[:start + 1]
+    for line in lines[start + 1:end]:
+        code, hash_, comment = line.partition("#")
+        words = code.split()
+        kept = [w for w in words if w not in remove]
+        if kept == words:
+            out.append(line)
+        elif kept or comment:
+            indent = re.match(r"\s*", line).group()
+            out.append(indent + " ".join(kept) + (f"  #{comment}" if hash_ else ""))
+    out += [f"    {p}" for p in add]
+    out += lines[end:]
+
+    new_text = "\n".join(out) + "\n"
+    parse(new_text)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(new_text)
+    os.replace(tmp, CONFIG)
+    return add, set(current) & remove
+
+
+def die(msg):
+    print(f"lordhelp: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg):
+    print(f"lordhelp: warning: {msg}", file=sys.stderr)
+
+
+def need_root():
+    if os.geteuid() != 0:
+        die("this command must be run as root (try sudo)")
+
+
+def run(*cmd, dry=False):
+    print("  $ " + " ".join(cmd))
+    if not dry:
+        subprocess.run(cmd, check=True)
+
+
+def output(*cmd, any_code=False):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return ""
+    return r.stdout if r.returncode == 0 or any_code else ""
+
+
+def query(*cmd):
+    return set(output(*cmd).split())
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def parallel(jobs):
+    from concurrent.futures import ThreadPoolExecutor
+    if len(jobs) <= 1:
+        return {k: f() for k, f in jobs.items()}
+    with ThreadPoolExecutor(len(jobs)) as ex:
+        futures = {k: ex.submit(f) for k, f in jobs.items()}
+        return {k: f.result() for k, f in futures.items()}
+
+
+Candidate = namedtuple("Candidate", "source id version desc stale members",
+                       defaults=("", "", False, ()))
+
+
+def entry_for(c):
+    return c.id if c.source == "repo" else f"{c.source}:{c.id}"
+
+
+def repo_lookup(name):
+    info = output("pacman", "-Si", name)
+    if info:
+        fields = dict(re.findall(r"^(\w[\w ]*?)\s*: (.*)$", info, re.M))
+        return [Candidate("repo", name, fields.get("Version", ""), fields.get("Description", ""))]
+    members = tuple(output("pacman", "-Sgq", name).split())
+    if members:
+        return [Candidate("repo", name, "group", f"package group ({len(members)} packages)",
+                          members=members)]
+    return []
+
+
+_aur_cache = {}
+
+
+def aur_fetch(names):
+    missing = [n for n in dict.fromkeys(names) if n not in _aur_cache]
+    if not missing:
+        return
+    import urllib.parse
+    import urllib.request
+    for i in range(0, len(missing), 150):
+        chunk = missing[i:i + 150]
+        q = urllib.parse.urlencode([("arg[]", n) for n in chunk])
+        try:
+            with urllib.request.urlopen(f"https://aur.archlinux.org/rpc/v5/info?{q}", timeout=15) as r:
+                found = {p["Name"]: p for p in json.load(r)["results"]}
+        except Exception as e:
+            warn(f"AUR lookup failed: {e}")
+            return
+        for n in chunk:
+            _aur_cache[n] = found.get(n)
+
+
+def aur_variants(name):
+    return (name, f"{name}-bin", f"{name}-git")
+
+
+def aur_lookup(name):
+    aur_fetch(aur_variants(name))
+    for v in aur_variants(name):
+        p = _aur_cache.get(v)
+        if p:
+            stale = bool(p.get("OutOfDate")) or p.get("NumVotes", 0) < 5
+            desc = f"{p.get('Description') or ''} [{p.get('NumVotes', 0)} votes]"
+            return [Candidate("aur", v, p.get("Version", ""), desc, stale)]
+    return []
+
+
+def flatpak_lookup(name):
+    if not have("flatpak"):
+        return []
+    want = name.lower()
+    for line in output("flatpak", "search", "--columns=application,name,version,description", name).splitlines():
+        cols = line.split("\t") + ["", "", ""]
+        app, title = cols[0], cols[1]
+        if want in (app.lower(), title.lower(), app.split(".")[-1].lower()):
+            return [Candidate("flatpak", app, cols[2], cols[3])]
+    return []
+
+
+def snap_lookup(name):
+    if not have("snap"):
+        return []
+    info = output("snap", "info", name)
+    if not info:
+        return []
+    summary = re.search(r"^summary:\s*(.*)$", info, re.M)
+    version = re.search(r"latest/stable:\s+(\S+)", info)
+    return [Candidate("snap", name, version.group(1) if version else "",
+                      summary.group(1) if summary else "")]
+
+
+LOOKUP = {"repo": repo_lookup, "aur": aur_lookup, "flatpak": flatpak_lookup, "snap": snap_lookup}
+
+
+def candidates(name, order):
+    """All sources that have `name`, best first."""
+    results = parallel({src: (lambda s=src: LOOKUP[s](name)) for src in order})
+    found = [c for src in order for c in results[src]]
+    return sorted(found, key=lambda c: (c.stale, order.index(c.source)))
+
+
+def candidates_many(names, order):
+    names = list(dict.fromkeys(names))
+    if "aur" in order:
+        aur_fetch([v for n in names for v in aur_variants(n)])
+    return parallel({n: (lambda n=n: candidates(n, order)) for n in names})
+
+
+def installed_flatpaks():
+    return query("flatpak", "list", "--app", "--system", "--columns=application") if have("flatpak") else set()
+
+
+def installed_snaps():
+    snaps = set()
+    if not have("snap"):
+        return snaps
+    for line in output("snap", "list").splitlines()[1:]:
+        cols = line.split()
+        if cols and not SNAP_SYSTEM.match(cols[0]) and cols[-1] not in ("base", "snapd", "core"):
+            snaps.add(cols[0])
+    return snaps
+
+
+def installed_groups():
+    groups = {}
+    for line in output("pacman", "-Qg").splitlines():
+        group, _, pkg = line.partition(" ")
+        groups.setdefault(group, set()).add(pkg)
+    return groups
+
+
+def unit_name(svc):
+    name = svc.lstrip("!")
+    return name if "." in name else name + ".service"
+
+
+def unit_states(services):
+    units = [unit_name(s) for s in services]
+    if not units or not have("systemctl"):
+        return {}
+    out = output("systemctl", "show", "--property=LoadState,UnitFileState", "--", *units, any_code=True)
+    states = {}
+    for unit, block in zip(units, out.strip().split("\n\n")):
+        props = dict(l.split("=", 1) for l in block.splitlines() if "=" in l)
+        states[unit] = (props.get("LoadState", ""), props.get("UnitFileState", ""))
+    return states
+
+
+def snapshot():
+    return parallel({
+        "installed": lambda: query("pacman", "-Qq"),
+        "explicit": lambda: query("pacman", "-Qqe"),
+        "foreign": lambda: query("pacman", "-Qqm"),
+        "groups": installed_groups,
+        "flatpak": installed_flatpaks,
+        "snap": installed_snaps,
+    })
+
+
+def load_managed():
+    # flatpaks/snaps installed by lordhelp; hand-installed ones are left alone
+    try:
+        with open(MANAGED) as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        m = {}
+    return {"flatpak": set(m.get("flatpak", [])), "snap": set(m.get("snap", []))}
+
+
+def update_managed(kind, add=(), remove=()):
+    m = load_managed()
+    m[kind] = (m[kind] | set(add)) - set(remove)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(MANAGED, "w") as f:
+        json.dump({k: sorted(v) for k, v in m.items()}, f, indent=2)
+
+
+def aur_user(cfg):
+    return cfg["settings"].get("aur_user") or os.environ.get("SUDO_USER")
+
+
+def aur_helper(cfg, user, dry):
+    pref = cfg["settings"].get("aur_helper", "auto")
+    for h in (AUR_HELPERS if pref == "auto" else (pref,)):
+        if have(h):
+            return h
+    name = "paru" if pref == "auto" else pref
+    print(f"==> no AUR helper found, bootstrapping {name}-bin")
+    run("pacman", "-S", "--needed", "--noconfirm", "base-devel", "git", dry=dry)
+    if not dry:
+        import glob
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="lordhelp-")
+        shutil.chown(tmp, user)
+        try:
+            run("sudo", "-u", user, "git", "clone", f"https://aur.archlinux.org/{name}-bin.git", f"{tmp}/b")
+            run("sudo", "-u", user, "sh", "-c", f"cd '{tmp}/b' && makepkg --noconfirm")
+            run("pacman", "-U", "--noconfirm", *glob.glob(f"{tmp}/b/*.pkg.tar.zst"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return name
+
+
+def install_by_source(cfg, by_source, dry=False, auto=True):
+    yes = ["--noconfirm"] if auto else []
+
+    if by_source.get("flatpak") and not have("flatpak"):
+        by_source.setdefault("repo", []).append("flatpak")
+    if by_source.get("snap") and not have("snap"):
+        by_source.setdefault("aur", []).append("snapd")
+
+    if by_source.get("repo"):
+        print(f"==> repo: {' '.join(by_source['repo'])}")
+        run("pacman", "-Syu" if auto else "-S", "--needed", *yes, *by_source["repo"], dry=dry)
+
+    if by_source.get("aur"):
+        print(f"==> aur: {' '.join(by_source['aur'])}")
+        user = aur_user(cfg)
+        if not user:
+            warn("AUR packages are built as a normal user: set 'aur_user' in settings "
+                 f"or run through sudo. Skipped: {' '.join(by_source['aur'])}")
+        else:
+            try:
+                helper = aur_helper(cfg, user, dry)
+                extra = ["--skipreview"] if helper == "paru" else []
+                run("sudo", "-u", user, helper, "-S", "--needed", *yes, *extra, *by_source["aur"], dry=dry)
+            except subprocess.CalledProcessError as e:
+                warn(f"AUR install failed ({e.returncode}); continuing")
+
+    if by_source.get("flatpak"):
+        print(f"==> flatpak: {' '.join(by_source['flatpak'])}")
+        run("flatpak", "remote-add", "--system", "--if-not-exists", "flathub", FLATHUB, dry=dry)
+        run("flatpak", "install", "--system", "-y", "flathub", *by_source["flatpak"], dry=dry)
+        if not dry:
+            update_managed("flatpak", add=by_source["flatpak"])
+
+    if by_source.get("snap"):
+        print(f"==> snap: {' '.join(by_source['snap'])}")
+        run("systemctl", "enable", "--now", "snapd.socket", dry=dry)
+        if not os.path.exists("/snap"):
+            run("ln", "-s", "/var/lib/snapd/snap", "/snap", dry=dry)
+        for s in by_source["snap"]:
+            try:
+                run("snap", "install", s, dry=dry)
+            except subprocess.CalledProcessError:
+                warn(f"'{s}' needs classic confinement (full system access), installing with --classic")
+                run("snap", "install", "--classic", s, dry=dry)
+        if not dry:
+            update_managed("snap", add=by_source["snap"])
+
+
+def disable_units_of(pkgs, dry=False):
+    # pacman leaves enabled units of removed packages as dangling symlinks
+    files = output("pacman", "-Qlq", *pkgs, any_code=True).split()
+    units = [os.path.basename(f) for f in files
+             if f.startswith("/usr/lib/systemd/system/") and not f.endswith("/")
+             and "@." not in f]
+    for unit, (_, state) in unit_states(units).items():
+        if state.startswith("enabled"):
+            run("systemctl", "disable", "--now", unit, dry=dry)
+
+
+def remove_by_source(by_source, dry=False, auto=True):
+    yes = ["--noconfirm"] if auto else []
+    if by_source.get("pacman"):
+        disable_units_of(by_source["pacman"], dry=dry)
+        run("pacman", "-Rns", *yes, *by_source["pacman"], dry=dry)
+    if by_source.get("flatpak"):
+        run("flatpak", "uninstall", "--system", "-y", *by_source["flatpak"], dry=dry)
+        run("flatpak", "uninstall", "--system", "-y", "--unused", dry=dry)
+        if not dry:
+            update_managed("flatpak", remove=by_source["flatpak"])
+    if by_source.get("snap"):
+        for s in by_source["snap"]:
+            run("snap", "remove", s, dry=dry)
+        if not dry:
+            update_managed("snap", remove=by_source["snap"])
+
+
+def resolve(entries, order, s):
+    # installed packages stay where they are; only new bare names get searched
+    want = {src: set() for src in SOURCES}
+    new = []
+    for entry in entries:
+        src, name = split_entry(entry)
+        if src in (None, "repo") and name in s["groups"]:
+            want["repo"] |= s["groups"][name]
+        elif src is not None:
+            want[src].add(name)
+        elif name in s["installed"]:
+            want["aur" if name in s["foreign"] else "repo"].add(name)
+        elif name in s["flatpak"]:
+            want["flatpak"].add(name)
+        elif name in s["snap"]:
+            want["snap"].add(name)
+        else:
+            new.append(entry)
+    if new:
+        for entry, found in candidates_many(new, order).items():
+            if not found:
+                warn(f"'{entry}' not found in any source ({' '.join(order)}), skipping")
+                continue
+            best = found[0]
+            if best.members:
+                want["repo"] |= set(best.members)
+            else:
+                want[best.source].add(best.id)
+            if entry_for(best) != entry:
+                print(f"  {entry} -> {entry_for(best)}")
+    return want
+
+
+ACTIVE_STATES = ("enabled", "enabled-runtime", "static", "alias", "indirect", "generated", "transient")
+
+
+def service_actions(services, states):
+    actions = []
+    for svc in services:
+        unit = unit_name(svc)
+        load, state = states.get(unit, ("", ""))
+        if svc.startswith("!"):
+            if state.startswith("enabled"):
+                actions.append(("disable", unit))
+        elif load == "not-found":
+            actions.append(("missing", unit))
+        elif state not in ACTIVE_STATES:
+            actions.append(("enable", unit))
+    return actions
+
+
+def plan(cfg):
+    r = parallel({"state": snapshot, "units": lambda: unit_states(cfg["services"])})
+    s = r["state"]
+    want = resolve(cfg["packages"], source_order(cfg), s)
+    installed, explicit, fp, sn = s["installed"], s["explicit"], s["flatpak"], s["snap"]
+    pac_want = want["repo"] | want["aur"]
+    p = {
+        "repo": sorted(want["repo"] - installed),
+        "aur": sorted(want["aur"] - installed),
+        "flatpak": sorted(want["flatpak"] - fp),
+        "snap": sorted(want["snap"] - sn),
+        "mark_explicit": sorted((pac_want & installed) - explicit),
+        "remove_pacman": [], "remove_flatpak": [], "remove_snap": [],
+        "services": service_actions(cfg["services"], r["units"]),
+    }
+    if cfg["settings"].get("remove_unlisted", True):
+        managed = load_managed()
+        p["remove_pacman"] = sorted(explicit - pac_want - PROTECTED)
+        p["remove_flatpak"] = sorted((fp & managed["flatpak"]) - want["flatpak"])
+        p["remove_snap"] = sorted((sn & managed["snap"]) - want["snap"])
+    return p
+
+
+def rebuild(dry=False):
+    cfg = load_config()
+    settings = cfg["settings"]
+    print(f"lordhelp: rebuilding from {CONFIG}{' (dry run)' if dry else ''}")
+    p = plan(cfg)
+    installing = any(p[k] for k in SOURCES)
+
+    install_by_source(cfg, {k: p[k] for k in SOURCES}, dry=dry)
+    if p["mark_explicit"]:
+        run("pacman", "-D", "--asexplicit", *p["mark_explicit"], dry=dry)
+
+    if p["remove_pacman"]:
+        print(f"==> removing {len(p['remove_pacman'])} unlisted package(s)")
+        run("pacman", "-D", "--asdeps", *p["remove_pacman"], dry=dry)
+        orphans = sorted(query("pacman", "-Qdtq")) if not dry else p["remove_pacman"]
+        p["remove_pacman"] = orphans
+    remove_by_source({"pacman": p["remove_pacman"], "flatpak": p["remove_flatpak"],
+                      "snap": p["remove_snap"]}, dry=dry)
+
+    # units may have just been installed
+    actions = p["services"]
+    if installing and not dry:
+        actions = service_actions(cfg["services"], unit_states(cfg["services"]))
+    for action, unit in actions:
+        if action == "missing":
+            warn(f"service {unit} not found, skipping")
+        else:
+            run("systemctl", action, "--now", unit, dry=dry)
+
+    try:
+        hostname = open("/etc/hostname").read().strip()
+    except OSError:
+        hostname = ""
+    if "hostname" in settings and hostname != settings["hostname"]:
+        run("hostnamectl", "set-hostname", settings["hostname"], dry=dry)
+    tz = settings.get("timezone")
+    if tz and not os.path.realpath("/etc/localtime").endswith(tz):
+        run("timedatectl", "set-timezone", tz, dry=dry)
+
+    if not dry:
+        save_generation()
+    print("lordhelp: system is in sync with holyconfig.arch")
+
+
+def choose(name, order, found):
+    src, pkg = split_entry(name)
+    if src is not None:
+        if src not in SOURCES:
+            die(f"unknown source '{src}' (valid: {' '.join(SOURCES)})")
+        found = candidates(pkg, [src])
+        return found[0] if found else Candidate(src, pkg)
+    if not found:
+        die(f"'{name}' not found in: {' '.join(order)}")
+    best, rest = found[0], found[1:]
+    also = f"  (also in: {', '.join(entry_for(c) for c in rest)})" if rest else ""
+    print(f"lordhelp: {name} -> {entry_for(best)} {best.version}{also}")
+    return best
+
+
+def install(args):
+    cfg = load_config()
+    order = source_order(cfg)
+    if "--from" in args:
+        i = args.index("--from")
+        order = args[i + 1:i + 2]
+        args = args[:i] + args[i + 2:]
+        if not order or order[0] not in SOURCES:
+            die(f"--from needs one of: {' '.join(SOURCES)}")
+    if not args:
+        die("usage: lordhelp install [--from SOURCE] <pkg>...")
+    found = candidates_many([a for a in args if ":" not in a], order)
+    chosen = [choose(a, order, found.get(a)) for a in args]
+    by_source = {}
+    for c in chosen:
+        by_source.setdefault(c.source, []).append(c.id)
+    install_by_source(cfg, by_source, auto=False)
+    added, _ = edit_packages(add=[entry_for(c) for c in chosen])
+    print(f"lordhelp: added to config: {' '.join(added) or '(already listed)'}")
+
+
+def matching_entries(cfg, arg):
+    out = []
+    for e in cfg["packages"]:
+        src, name = split_entry(e)
+        if arg in (e, name) or (src == "flatpak" and name.split(".")[-1].lower() == arg.lower()):
+            out.append(e)
+    return out
+
+
+def remove(args, uninstall=True):
+    if not args:
+        die("usage: lordhelp remove <pkg>...")
+    cfg = load_config()
+    entries = [e for a in args for e in (matching_entries(cfg, a) or [a])]
+    _, removed = edit_packages(remove=entries)
+    print(f"lordhelp: removed from config: {' '.join(sorted(removed)) or '(not listed)'}")
+    if not uninstall:
+        return
+    s = snapshot()
+    pac, fp, sn = s["installed"], s["flatpak"], s["snap"]
+    by_source = {"pacman": [], "flatpak": [], "snap": []}
+    for e in entries:
+        src, name = split_entry(e)
+        if src in (None, "repo", "aur") and name in pac:
+            by_source["pacman"].append(name)
+        elif src in (None, "flatpak") and name in fp:
+            by_source["flatpak"].append(name)
+        elif src in (None, "snap") and name in sn:
+            by_source["snap"].append(name)
+    remove_by_source(by_source, auto=False)
+
+
+def search(args):
+    if not args:
+        die("usage: lordhelp search <name>")
+    cfg = load_config() if os.path.exists(CONFIG) else {"settings": {}}
+    order = source_order(cfg)
+    results = candidates_many(args, order)
+    for name in args:
+        found = results[name]
+        if not found:
+            print(f"{name}: not found in {' '.join(order)}")
+        for n, c in enumerate(found):
+            mark = "*" if n == 0 else " "
+            note = "  (out of date / few votes)" if c.stale else ""
+            print(f"{mark} {entry_for(c):40} {c.version:20} {c.desc}{note}")
+
+
+def generations():
+    if not os.path.isdir(GEN_DIR):
+        return []
+    return sorted(int(f.split(".")[0]) for f in os.listdir(GEN_DIR) if f.endswith(".arch"))
+
+
+def save_generation():
+    os.makedirs(GEN_DIR, exist_ok=True)
+    gens = generations()
+    if gens:
+        with open(os.path.join(GEN_DIR, f"{gens[-1]}.arch")) as a, open(CONFIG) as b:
+            if a.read() == b.read():
+                return
+    n = (gens[-1] + 1) if gens else 1
+    shutil.copy(CONFIG, os.path.join(GEN_DIR, f"{n}.arch"))
+    print(f"lordhelp: saved generation {n}")
+
+
+def rollback(target=None):
+    gens = generations()
+    if len(gens) < 2 and target is None:
+        die("no previous generation to roll back to")
+    n = int(target) if target else gens[-2]
+    if n not in gens:
+        die(f"generation {n} does not exist")
+    shutil.copy(os.path.join(GEN_DIR, f"{n}.arch"), CONFIG)
+    print(f"lordhelp: restored generation {n}")
+    rebuild()
+
+
+def init(force=False):
+    if os.path.exists(CONFIG) and not force:
+        die(f"{CONFIG} already exists (use --force to overwrite)")
+    fp, sn = installed_flatpaks(), installed_snaps()
+    pkgs = (sorted(query("pacman", "-Qqen"))
+            + [f"aur:{p}" for p in sorted(query("pacman", "-Qqem"))]
+            + [f"flatpak:{a}" for a in sorted(fp)]
+            + [f"snap:{s}" for s in sorted(sn)])
+    svcs = sorted(u[:-len(".service")] for u in
+                  query("systemctl", "list-unit-files", "--type=service",
+                        "--state=enabled", "--no-legend")
+                  if u.endswith(".service") and "@" not in u)
+    host = open("/etc/hostname").read().strip() if os.path.exists("/etc/hostname") else "holyarch"
+    tz = os.path.realpath("/etc/localtime").split("zoneinfo/")[-1]
+
+    text = (
+        "# apply changes with `sudo rebuildconfig` or a reboot\n\n"
+        "settings {\n"
+        f'    hostname = "{host}"\n'
+        f'    timezone = "{tz}"\n'
+        "    remove_unlisted = true\n"
+        f'    sources = "{DEFAULT_ORDER}"\n'
+        '    aur_helper = "auto"\n'
+        '    # aur_user = "you"\n'
+        "}\n\n"
+        "packages {\n" + "".join(f"    {p}\n" for p in pkgs) + "}\n\n"
+        "services {\n" + "".join(f"    {s}\n" for s in svcs) + "}\n"
+    )
+    parse(text)
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        f.write(text)
+    update_managed("flatpak", add=fp)
+    update_managed("snap", add=sn)
+    print(f"lordhelp: wrote {CONFIG} ({len(pkgs)} packages, {len(svcs)} services)")
+    save_generation()
+
+
+USAGE = """usage: lordhelp <command> [args]
+
+  install [--from SRC] <pkg>...
+                          find the best source, install now, add to config
+                          (SRC = repo | aur | flatpak | snap, or write aur:pkg)
+  search <pkg>...         show every source that has it, best first (*)
+  remove <pkg>...         uninstall now and remove from holyconfig.arch
+  add <pkg>...            only add to config (applied on rebuild/reboot)
+  del <pkg>...            only remove from config (applied on rebuild/reboot)
+  rebuildconfig [--dry-run]
+                          make the system match holyconfig.arch
+  diff                    show what rebuildconfig would change
+  check                   validate holyconfig.arch syntax
+  init [--force]          create holyconfig.arch from the current system
+  generations             list saved configs
+  rollback [N]            restore generation N (default: previous) and rebuild
+"""
+
+
+def hook_installed():
+    if not os.path.exists(CONFIG):
+        return
+    explicit, foreign = query("pacman", "-Qqe"), query("pacman", "-Qqm")
+    new = [f"aur:{p}" if p in foreign else p
+           for p in sys.stdin.read().split() if p in explicit]
+    added, _ = edit_packages(add=new)
+    if added:
+        print(f"lordhelp: recorded in holyconfig.arch: {' '.join(added)}")
+
+
+def hook_removed():
+    if not os.path.exists(CONFIG):
+        return
+    targets = sys.stdin.read().split()
+    _, removed = edit_packages(remove=[w for t in targets for w in (t, f"aur:{t}", f"repo:{t}")])
+    if removed:
+        print(f"lordhelp: dropped from holyconfig.arch: {' '.join(sorted(removed))}")
+
+
+def show_diff():
+    p = plan(load_config())
+    for key, sign in (("repo", "+"), ("aur", "+"), ("flatpak", "+"), ("snap", "+"),
+                      ("remove_pacman", "-"), ("remove_flatpak", "-"), ("remove_snap", "-"),
+                      ("mark_explicit", "~")):
+        for pkg in p[key]:
+            print(f"{sign} {key.replace('remove_', ''):8} {pkg}")
+    for action, unit in p["services"]:
+        sign = {"enable": "+", "disable": "-"}.get(action, "?")
+        note = "  (not installed yet)" if action == "missing" else ""
+        print(f"{sign} service  {unit}{note}")
+    if not any(p.values()):
+        print("lordhelp: no changes")
+
+
+def show_generations():
+    import time
+    for n in generations():
+        mtime = os.path.getmtime(os.path.join(GEN_DIR, f"{n}.arch"))
+        print(f"  {n:4d}  {time.ctime(mtime)}")
+
+
+def add(args):
+    if not args:
+        die("usage: lordhelp add <pkg>...")
+    added, _ = edit_packages(add=args)
+    print(f"lordhelp: added to config: {' '.join(added) or '(already listed)'}")
+
+
+def rebuildconfig(args):
+    # a fresh install has no config until its first boot
+    if not os.path.exists(CONFIG):
+        init()
+    else:
+        rebuild(dry="--dry-run" in args)
+
+
+def check():
+    cfg = load_config()
+    print(f"lordhelp: OK - {len(cfg['packages'])} packages, {len(cfg['services'])} services")
+
+
+# name: (handler, needs root)
+COMMANDS = {
+    "install": (install, True),
+    "remove": (lambda a: remove(a, uninstall=True), True),
+    "add": (add, True),
+    "del": (lambda a: remove(a, uninstall=False), True),
+    "search": (search, False),
+    "rebuildconfig": (rebuildconfig, True),
+    "diff": (lambda a: show_diff(), False),
+    "check": (lambda a: check(), False),
+    "init": (lambda a: init(force="--force" in a), True),
+    "generations": (lambda a: show_generations(), False),
+    "rollback": (lambda a: rollback(a[0] if a else None), True),
+    # used by the pacman hooks, package names come on stdin
+    "_hook-installed": (lambda a: hook_installed(), False),
+    "_hook-removed": (lambda a: hook_removed(), False),
+}
+
+
+def main(argv):
+    if os.path.basename(argv[0]) == "rebuildconfig":
+        argv = ["lordhelp", "rebuildconfig"] + argv[1:]
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd, args = argv[1], argv[2:]
+    if cmd not in COMMANDS:
+        die(f"unknown command '{cmd}'\n\n{USAGE}")
+    handler, root = COMMANDS[cmd]
+    if root:
+        need_root()
+    handler(args)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except subprocess.CalledProcessError as e:
+        die(f"command failed ({e.returncode}): {' '.join(e.cmd)}")
+    except HolySyntaxError as e:
+        die(str(e))

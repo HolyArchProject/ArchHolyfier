@@ -1,0 +1,34 @@
+# apply changes with `sudo rebuildconfig` or a reboot
+
+settings {
+    hostname = "holybox"
+    timezone = "Europe/Warsaw"
+    remove_unlisted = true
+    sources = "repo aur flatpak snap"
+    aur_helper = "auto"
+    aur_user = "you"
+}
+
+packages {
+    base
+    linux
+    linux-firmware
+    python
+    sudo
+
+    plasma-meta
+    firefox
+    kitty
+
+    git neovim base-devel
+
+    aur:visual-studio-code-bin
+    flatpak:com.spotify.Client
+    discord
+}
+
+services {
+    NetworkManager
+    sshd
+    !bluetooth
+}

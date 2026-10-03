@@ -1,0 +1,27 @@
+pkgname=holyarch
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Declarative package and service config for HolyArch (holyconfig.arch)"
+arch=('any')
+license=('MIT')
+depends=('python' 'pacman' 'systemd' 'sudo')
+optdepends=('paru: AUR support (bootstrapped automatically if missing)'
+            'yay: AUR support'
+            'git: bootstrapping an AUR helper'
+            'flatpak: Flatpak support (installed automatically when needed)')
+install=holyarch.install
+source=(lordhelp
+        holyarch-installed.hook
+        holyarch-removed.hook
+        holyarch-rebuild.service
+        holyconfig.arch)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm755 lordhelp "$pkgdir/usr/bin/lordhelp"
+  ln -s lordhelp "$pkgdir/usr/bin/rebuildconfig"
+  install -Dm644 holyarch-installed.hook "$pkgdir/usr/share/libalpm/hooks/holyarch-installed.hook"
+  install -Dm644 holyarch-removed.hook   "$pkgdir/usr/share/libalpm/hooks/holyarch-removed.hook"
+  install -Dm644 holyarch-rebuild.service "$pkgdir/usr/lib/systemd/system/holyarch-rebuild.service"
+  install -Dm644 holyconfig.arch "$pkgdir/usr/share/holyarch/holyconfig.example.arch"
+}

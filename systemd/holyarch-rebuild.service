@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply HolyArch configuration (holyconfig.arch)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/lordhelp rebuildconfig
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

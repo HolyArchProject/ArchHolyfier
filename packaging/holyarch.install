@@ -1,0 +1,8 @@
+post_install() {
+  # holyconfig.arch is generated on first boot
+  systemctl enable holyarch-rebuild.service >/dev/null 2>&1 || true
+}
+
+pre_remove() {
+  systemctl disable holyarch-rebuild.service >/dev/null 2>&1 || true
+}

@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Removing packages from holyconfig.arch...
+When = PostTransaction
+Exec = /usr/bin/lordhelp _hook-removed
+NeedsTargets
