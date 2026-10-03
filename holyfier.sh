@@ -77,6 +77,9 @@ cat << EOF > /etc/fastfetch/config.jsonc
         "cpu",
         "gpu",
         "memory",
+        "swap",
+        "disk",
+        "PhysicalDisk",
         "colors"
     ]
 }
